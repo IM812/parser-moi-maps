@@ -16,8 +16,18 @@ export async function POST(request: Request) {
   const { city, categoryId, keyword } = body
   const category = getCategory(categoryId)
   const osmId = Number(city?.osmId)
+  const bbox = Array.isArray(city?.bbox) ? city.bbox.map(Number) : []
+  const [south, west, north, east] = bbox
+  const validBbox =
+    bbox.length === 4 &&
+    bbox.every(Number.isFinite) &&
+    north > south &&
+    east > west &&
+    north - south < 3 &&
+    east - west < 5
   if (
     !category ||
+    !validBbox ||
     !Number.isInteger(osmId) ||
     !["node", "way", "relation"].includes(city?.osmType) ||
     !Number.isFinite(Number(city?.lat)) ||
@@ -36,7 +46,7 @@ export async function POST(request: Request) {
 
   try {
     const result = await searchLeads(
-      { ...city, osmId, lat: Number(city.lat), lon: Number(city.lon) },
+      { ...city, osmId, lat: Number(city.lat), lon: Number(city.lon), bbox: [south, west, north, east] },
       category,
       keyword,
       limit,

@@ -6,6 +6,7 @@ export type City = {
   osmId: number
   lat: number
   lon: number
+  bbox: [south: number, west: number, north: number, east: number]
 }
 
 export type Lead = {

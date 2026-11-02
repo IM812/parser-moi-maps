@@ -7,6 +7,7 @@ const OVERPASS_ENDPOINTS = [
   "https://overpass-api.de/api/interpreter",
   "https://overpass.kumi.systems/api/interpreter",
   "https://overpass.private.coffee/api/interpreter",
+  "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
 ]
 
 type NominatimItem = {
@@ -18,6 +19,21 @@ type NominatimItem = {
   name: string
   display_name: string
   addresstype?: string
+  boundingbox: [string, string, string, string]
+}
+
+const MIN_HALF_SPAN = 0.06
+
+function toBbox(item: NominatimItem): City["bbox"] {
+  const [s, n, w, e] = item.boundingbox.map(Number)
+  const lat = Number(item.lat)
+  const lon = Number(item.lon)
+  return [
+    Math.min(s, lat - MIN_HALF_SPAN),
+    Math.min(w, lon - MIN_HALF_SPAN * 1.8),
+    Math.max(n, lat + MIN_HALF_SPAN),
+    Math.max(e, lon + MIN_HALF_SPAN * 1.8),
+  ]
 }
 
 export async function searchCities(query: string): Promise<City[]> {
@@ -27,6 +43,7 @@ export async function searchCities(query: string): Promise<City[]> {
   url.searchParams.set("limit", "8")
   url.searchParams.set("accept-language", "ru")
   url.searchParams.set("featureType", "settlement")
+  url.searchParams.set("addressdetails", "0")
 
   const res = await fetch(url, {
     headers: { "User-Agent": USER_AGENT },
@@ -43,6 +60,7 @@ export async function searchCities(query: string): Promise<City[]> {
     osmId: item.osm_id,
     lat: Number(item.lat),
     lon: Number(item.lon),
+    bbox: toBbox(item),
   }))
 }
 
@@ -53,20 +71,11 @@ function escapeRegex(value: string) {
 function buildQuery(city: City, category: Category, keyword: string | undefined, limit: number) {
   const nameFilter = keyword?.trim() ? `["name"~"${escapeRegex(keyword.trim())}",i]` : '["name"]'
 
-  let areaSetup = ""
-  let scope = ""
-  if (city.osmType === "relation") {
-    areaSetup = `area(id:${3600000000 + city.osmId})->.city;`
-    scope = "(area.city)"
-  } else if (city.osmType === "way") {
-    areaSetup = `area(id:${2400000000 + city.osmId})->.city;`
-    scope = "(area.city)"
-  } else {
-    scope = `(around:12000,${city.lat},${city.lon})`
-  }
-
-  const parts = category.selectors.map((sel) => `nwr${sel}${nameFilter}${scope};`).join("")
-  return `[out:json][timeout:90];${areaSetup}(${parts});out center tags ${limit};`
+  // A bounding box uses Overpass's spatial index and is far cheaper than area() lookups,
+  // which public mirrors frequently reject with 502/504 for large cities.
+  const bbox = city.bbox.map((n) => n.toFixed(5)).join(",")
+  const parts = category.selectors.map((sel) => `nwr${sel}${nameFilter};`).join("")
+  return `[out:json][timeout:50][bbox:${bbox}];(${parts});out center tags ${limit};`
 }
 
 type OverpassElement = {
@@ -78,9 +87,20 @@ type OverpassElement = {
   tags?: Record<string, string>
 }
 
+const HEDGE_DELAY_MS = 4_000
+const REQUEST_TIMEOUT_MS = 90_000
+
+// Public Overpass mirrors are often slow or overloaded, so requests are hedged:
+// the next mirror starts if the previous one hasn't answered within HEDGE_DELAY_MS,
+// and the first successful response wins while the rest are aborted.
 async function runOverpass(query: string): Promise<OverpassElement[]> {
-  let lastError: unknown
-  for (const endpoint of OVERPASS_ENDPOINTS) {
+  const controllers = OVERPASS_ENDPOINTS.map(() => new AbortController())
+  let settled = false
+
+  const attempts = OVERPASS_ENDPOINTS.map(async (endpoint, i) => {
+    if (i > 0) await new Promise((r) => setTimeout(r, i * HEDGE_DELAY_MS))
+    if (settled) throw new Error("skipped")
+    const timer = setTimeout(() => controllers[i].abort(), REQUEST_TIMEOUT_MS)
     try {
       const res = await fetch(endpoint, {
         method: "POST",
@@ -90,19 +110,26 @@ async function runOverpass(query: string): Promise<OverpassElement[]> {
         },
         body: `data=${encodeURIComponent(query)}`,
         cache: "no-store",
-        signal: AbortSignal.timeout(95_000),
+        signal: controllers[i].signal,
       })
-      if (!res.ok) {
-        lastError = new Error(`${endpoint}: ${res.status}`)
-        continue
-      }
-      const json = (await res.json()) as { elements: OverpassElement[] }
-      return json.elements ?? []
-    } catch (error) {
-      lastError = error
+      if (!res.ok) throw new Error(`${endpoint}: ${res.status}`)
+      const json = (await res.json()) as { elements?: OverpassElement[]; remark?: string }
+      if (!json.elements) throw new Error(json.remark ?? "empty response")
+      return json.elements
+    } finally {
+      clearTimeout(timer)
     }
+  })
+
+  try {
+    const elements = await Promise.any(attempts)
+    return elements
+  } catch {
+    throw new Error("Overpass недоступен")
+  } finally {
+    settled = true
+    controllers.forEach((c) => c.abort())
   }
-  throw lastError instanceof Error ? lastError : new Error("Overpass недоступен")
 }
 
 const pick = (tags: Record<string, string>, ...keys: string[]) => {
